@@ -1,3 +1,10 @@
+# Core dependency required by the pipeline.
 opencv-python>=4.7.0
-numpy>=1.23.0
-pandas>=1.5.0
+
+# NumPy ships automatically with the official OpenCV wheels, but you may
+# uncomment the line below if your environment needs an explicit pin.
+# numpy>=1.23.0
+
+# The pipeline now uses the Python standard library for CSV/JSON bookkeeping,
+# so pandas is no longer required.  Uncomment if you rely on it elsewhere.
+# pandas>=1.5.0

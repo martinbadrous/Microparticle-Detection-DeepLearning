@@ -14,7 +14,7 @@ It supports:
 - ✅ Real-time analysis from video or live camera feeds  
 - ✅ Batch processing of folders of microscope images  
 - ✅ Reproducible per-frame counts and aggregated metrics  
-- ✅ Lightweight dependency footprint (OpenCV + NumPy + pandas)  
+- ✅ Lightweight dependency footprint (just OpenCV, standard library for logging)
 
 Applications include:
 - 🧫 **Environmental research** – microplastics or microbe detection  
@@ -147,8 +147,8 @@ Each particle is annotated with its ID and boundary, with live count displayed i
 
 ```bash
 opencv-python>=4.7.0
-numpy>=1.23.0
-pandas>=1.5.0
+# numpy (optional, ships with OpenCV wheels)
+# pandas (optional, no longer required for the pipeline)
 ```
 
 ---

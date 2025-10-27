@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Microparticle Counting & Tracking - Modern Pipeline (OpenCV + Python)
-Author: Martin Badrous (repo modernization)
+"""Microparticle Counting & Tracking pipeline.
 
-Features
-- Clean CLI with argparse
-- Flexible inputs: video file, webcam, or image folder
-- Pluggable detectors: Hough circles or contour-based
-- Simple online tracker with stable IDs (centroid tracking with aging)
-- CSV logging of per-frame counts + summary JSON
-- Optional annotated video export (MP4/H264) and frame snapshots
-- Reproducible, dependency-light (opencv-python, numpy, pandas)
+This module powers the command-line interface advertised in the README.  The
+original implementation depended on NumPy and pandas primarily for type hints
+and convenience wrappers around CSV/JSON handling.  Those imports made the
+script unusable in lightweight environments where only OpenCV was available, as
+simply executing ``python microparticle_pipeline.py --help`` would crash before
+``argparse`` had a chance to show usage information.  To make the thesis code
+usable out-of-the-box we now defer the heavy OpenCV import and rely solely on
+standard-library helpers for bookkeeping.
 
 Examples
 --------
@@ -26,21 +24,39 @@ python microparticle_pipeline.py --input 0 --detector hough --display
 """
 
 import argparse
+import csv
 import json
-from pathlib import Path
-from typing import List, Tuple, Optional, Iterable, Dict
-
-import cv2
-import numpy as np
-import pandas as pd
+import math
+import sys
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:  # pragma: no cover - exercised indirectly via run_pipeline
+    import cv2  # type: ignore
+except ImportError as exc:  # pragma: no cover - handled at runtime
+    cv2 = None  # type: ignore[assignment]
+    CV2_IMPORT_ERROR = exc
+else:  # pragma: no cover - handled at runtime
+    CV2_IMPORT_ERROR = None
 
 # -------------------------
 # I/O readers
 # -------------------------
 
+def require_cv2() -> Any:
+    """Return the OpenCV module or raise a friendly error if missing."""
+
+    if cv2 is None:  # pragma: no cover - depends on runtime environment
+        raise RuntimeError(
+            "OpenCV (cv2) is required to run this pipeline. Install it with "
+            "`pip install opencv-python` or `pip install opencv-python-headless`."
+        ) from CV2_IMPORT_ERROR
+    return cv2
+
+
 class FrameSource:
-    def __iter__(self) -> Iterable[Tuple[int, np.ndarray]]:
+    def __iter__(self) -> Iterable[Tuple[int, Any]]:
         raise NotImplementedError
 
 class VideoReader(FrameSource):
@@ -48,10 +64,11 @@ class VideoReader(FrameSource):
         self.path_or_index = path_or_index
 
     def __iter__(self):
+        cv2_local = require_cv2()
         if isinstance(self.path_or_index, int) or str(self.path_or_index).isdigit():
-            cap = cv2.VideoCapture(int(self.path_or_index))
+            cap = cv2_local.VideoCapture(int(self.path_or_index))
         else:
-            cap = cv2.VideoCapture(str(self.path_or_index))
+            cap = cv2_local.VideoCapture(str(self.path_or_index))
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video/camera: {self.path_or_index}")
         idx = 0
@@ -70,8 +87,9 @@ class ImageFolderReader(FrameSource):
             raise RuntimeError(f"No images found in folder: {folder}")
 
     def __iter__(self):
+        cv2_local = require_cv2()
         for i, p in enumerate(self.paths):
-            img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+            img = cv2_local.imread(str(p), cv2_local.IMREAD_COLOR)
             if img is None:
                 continue
             yield i, img
@@ -106,17 +124,17 @@ class HoughCircleDetector:
         self.max_radius = max_radius
         self.blur_ksize = blur_ksize
 
-    def __call__(self, frame: np.ndarray) -> List[Detection]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def __call__(self, frame: Any) -> List[Detection]:
+        cv2_local = require_cv2()
+        gray = cv2_local.cvtColor(frame, cv2_local.COLOR_BGR2GRAY)
         if self.blur_ksize > 0:
-            gray = cv2.GaussianBlur(gray, (self.blur_ksize, self.blur_ksize), 0)
-        circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=self.dp, minDist=self.min_dist,
+            gray = cv2_local.GaussianBlur(gray, (self.blur_ksize, self.blur_ksize), 0)
+        circles = cv2_local.HoughCircles(gray, cv2_local.HOUGH_GRADIENT, dp=self.dp, minDist=self.min_dist,
                                    param1=self.param1, param2=self.param2,
                                    minRadius=self.min_radius, maxRadius=self.max_radius)
         dets: List[Detection] = []
         if circles is not None:
-            circles = np.uint16(np.around(circles))[0, :]
-            for (x, y, r) in circles:
+            for (x, y, r) in circles[0, :]:
                 dets.append(Detection(cx=float(x), cy=float(y), r=float(r), score=1.0))
         return dets
 
@@ -128,24 +146,25 @@ class ContourDetector:
         self.max_area = max_area
         self.adaptive = adaptive
 
-    def __call__(self, frame: np.ndarray) -> List[Detection]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def __call__(self, frame: Any) -> List[Detection]:
+        cv2_local = require_cv2()
+        gray = cv2_local.cvtColor(frame, cv2_local.COLOR_BGR2GRAY)
         if self.adaptive:
-            bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 21, 2)
+            bw = cv2_local.adaptiveThreshold(gray, 255, cv2_local.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2_local.THRESH_BINARY_INV, 21, 2)
         else:
-            _, bw = cv2.threshold(gray, self.thresh, 255, cv2.THRESH_BINARY_INV)
+            _, bw = cv2_local.threshold(gray, self.thresh, 255, cv2_local.THRESH_BINARY_INV)
         if self.morph_kernel > 0:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.morph_kernel, self.morph_kernel))
-            bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k, iterations=1)
-            bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k, iterations=1)
-        cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            k = cv2_local.getStructuringElement(cv2_local.MORPH_ELLIPSE, (self.morph_kernel, self.morph_kernel))
+            bw = cv2_local.morphologyEx(bw, cv2_local.MORPH_OPEN, k, iterations=1)
+            bw = cv2_local.morphologyEx(bw, cv2_local.MORPH_CLOSE, k, iterations=1)
+        cnts, _ = cv2_local.findContours(bw, cv2_local.RETR_EXTERNAL, cv2_local.CHAIN_APPROX_SIMPLE)
         dets: List[Detection] = []
         for c in cnts:
-            a = cv2.contourArea(c)
+            a = cv2_local.contourArea(c)
             if a < self.min_area or a > self.max_area:
                 continue
-            (x, y), r = cv2.minEnclosingCircle(c)
+            (x, y), r = cv2_local.minEnclosingCircle(c)
             dets.append(Detection(cx=float(x), cy=float(y), r=float(r), score=1.0))
         return dets
 
@@ -182,7 +201,7 @@ class CentroidTracker:
         self.tracks: Dict[int, Track] = {}
 
     def _distance(self, a: Track, b: Detection) -> float:
-        return float(np.hypot(a.cx - b.cx, a.cy - b.cy))
+        return float(math.hypot(a.cx - b.cx, a.cy - b.cy))
 
     def update(self, detections: List[Detection]) -> List[Track]:
         # Aging
@@ -231,50 +250,93 @@ class CentroidTracker:
 # Drawing helpers
 # -------------------------
 
-def draw_annotations(frame: np.ndarray, tracks: List[Track], color=(0, 255, 0)) -> np.ndarray:
+def draw_annotations(frame: Any, tracks: List[Track], color=(0, 255, 0)) -> Any:
+    cv2_local = require_cv2()
     vis = frame.copy()
     for tr in tracks:
-        cv2.circle(vis, (int(tr.cx), int(tr.cy)), int(max(2, tr.r)), color, 2)
-        cv2.putText(vis, f"ID {tr.track_id}", (int(tr.cx)+5, int(tr.cy)-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2, cv2.LINE_AA)
-    cv2.putText(vis, f"Count (active): {len(tracks)}", (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2, cv2.LINE_AA)
+        cv2_local.circle(vis, (int(tr.cx), int(tr.cy)), int(max(2, tr.r)), color, 2)
+        cv2_local.putText(vis, f"ID {tr.track_id}", (int(tr.cx)+5, int(tr.cy)-5),
+                          cv2_local.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2_local.LINE_AA)
+    cv2_local.putText(vis, f"Count (active): {len(tracks)}", (10, 24),
+                      cv2_local.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2_local.LINE_AA)
     return vis
+
+# -------------------------
+# Persistence helpers (standard library only)
+# -------------------------
+
+def _resolve_resize(frame: Any, width: int, height: int) -> Tuple[int, int]:
+    """Return a target (width, height) keeping aspect ratio when one dim is zero."""
+
+    h, w = frame.shape[:2]
+    if width > 0 and height > 0:
+        return width, height
+    if width > 0:
+        scale = width / float(w)
+        return width, max(1, int(round(h * scale)))
+    if height > 0:
+        scale = height / float(h)
+        return max(1, int(round(w * scale))), height
+    return w, h
+
+
+def _write_counts(csv_path: Path, rows: List[Dict[str, int]]) -> None:
+    with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=["frame", "count_active"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _build_summary(rows: List[Dict[str, int]], unique_ids_seen, args) -> Dict[str, Any]:
+    frames_processed = len(rows)
+    avg_active = (
+        sum(row["count_active"] for row in rows) / frames_processed if frames_processed else 0.0
+    )
+    return {
+        "frames_processed": int(frames_processed),
+        "total_unique_ids": int(len(unique_ids_seen)),
+        "avg_active_per_frame": float(avg_active),
+        "detector": args.detector,
+        "params": vars(args),
+    }
 
 # -------------------------
 # Main pipeline
 # -------------------------
 
 def run_pipeline(args):
+    cv2_local = require_cv2()
     source = infer_source(args.input)
     detector = build_detector(args)
     tracker = CentroidTracker(max_age=args.max_age, dist_thresh=args.track_dist)
 
-    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "counts.csv"
     summary_path = out_dir / "summary.json"
 
-    writer = None
+    video_writer: Optional[Dict[str, Any]] = None
     if args.save_video:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        frame_size = None
-        # we'll determine size dynamically from first frame if not provided
-        writer = {"fourcc": fourcc, "obj": None}
+        fourcc = cv2_local.VideoWriter_fourcc(*"mp4v")
+        video_writer = {"fourcc": fourcc, "obj": None}
 
-    rows = []
+    rows: List[Dict[str, int]] = []
     unique_ids_seen = set()
-    first_size = None
+    first_size: Optional[Tuple[int, int]] = None
 
     for idx, frame in source:
-        if args.width > 0 and args.height > 0:
-            frame = cv2.resize(frame, (args.width, args.height), interpolation=cv2.INTER_LINEAR)
+        if args.width > 0 or args.height > 0:
+            target_w, target_h = _resolve_resize(frame, args.width, args.height)
+            frame = cv2_local.resize(frame, (target_w, target_h), interpolation=cv2_local.INTER_LINEAR)
 
         if first_size is None:
             first_size = (frame.shape[1], frame.shape[0])
-            if args.save_video:
+            if args.save_video and video_writer is not None:
                 w, h = first_size
-                vw = cv2.VideoWriter(str(out_dir / "annotated.mp4"), writer["fourcc"], args.fps if args.fps>0 else 25, (w, h))
-                writer["obj"] = vw
+                fps = args.fps if args.fps > 0 else 25
+                vw = cv2_local.VideoWriter(str(out_dir / "annotated.mp4"), video_writer["fourcc"], fps, (w, h))
+                video_writer["obj"] = vw
 
         dets = detector(frame)
         tracks = tracker.update(dets)
@@ -287,27 +349,21 @@ def run_pipeline(args):
 
         vis = draw_annotations(frame, tracks)
         if args.display:
-            cv2.imshow("Microparticle Counting", vis)
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC
+            cv2_local.imshow("Microparticle Counting", vis)
+            if cv2_local.waitKey(1) & 0xFF == 27:  # ESC
                 break
-        if args.save_video and writer["obj"] is not None:
-            writer["obj"].write(vis)
+        if args.save_video and video_writer is not None and video_writer["obj"] is not None:
+            video_writer["obj"].write(vis)
         if args.save_frames:
-            cv2.imwrite(str(out_dir / f"frame_{idx:06d}.jpg"), vis)
+            cv2_local.imwrite(str(out_dir / f"frame_{idx:06d}.jpg"), vis)
 
-    if args.save_video and writer["obj"] is not None:
-        writer["obj"].release()
-    cv2.destroyAllWindows()
+    if args.save_video and video_writer is not None and video_writer["obj"] is not None:
+        video_writer["obj"].release()
+    if cv2 is not None:  # pragma: no cover - depends on environment
+        cv2_local.destroyAllWindows()
 
-    df = pd.DataFrame(rows)
-    df.to_csv(csv_path, index=False)
-    summary = {
-        "frames_processed": int(len(rows)),
-        "total_unique_ids": int(len(unique_ids_seen)),
-        "avg_active_per_frame": float(df["count_active"].mean() if len(df) else 0.0),
-        "detector": args.detector,
-        "params": vars(args),
-    }
+    _write_counts(csv_path, rows)
+    summary = _build_summary(rows, unique_ids_seen, args)
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
@@ -362,7 +418,11 @@ def build_argparser():
 
 def main():
     args = build_argparser().parse_args()
-    run_pipeline(args)
+    try:
+        run_pipeline(args)
+    except (RuntimeError, ValueError) as exc:  # pragma: no cover - CLI convenience
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
